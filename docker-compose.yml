@@ -1,0 +1,37 @@
+version: "3.7"
+
+services:
+  fiber-server:
+    build: .
+    ports: [ "3000:3000" ]
+    env_file:
+      - env
+    depends_on:
+      - postgresql
+      - redis
+
+  redis:
+    image: redis:6.2-alpine
+    restart: always
+    ports:
+      - '6379:6379'
+    command: redis-server --save 20 1 --loglevel warning
+    volumes:
+      - redis:/data
+
+  postgresql:
+    image: postgres:16
+    ports:
+      - 5455:5455
+    volumes:
+      - ~/apps/postgres:/var/lib/postgresql/data
+    env_file:
+      - env
+    environment:
+      PGPORT: 5455
+      POSTGRES_DB: "matchmaking"
+    restart: always
+
+volumes:
+  pg_data:
+  redis:
