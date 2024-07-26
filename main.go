@@ -1,43 +1,98 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"github.com/go-redis/redis/v8"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/log"
-	"github.com/gofiber/fiber/v2/middleware/timeout"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"os"
 	"strconv"
 	"time"
 )
 
-// Initialize a connection pool
-func initializeDbConnectionPool() (*pgxpool.Pool, error) {
-	connString := fmt.Sprintf("postgres://%s:%s@postgresql:%s/%s?sslmode=disable", os.Getenv("POSTGRES_USER"), os.Getenv("POSTGRES_PASSWORD"), os.Getenv("POSTGRES_PORT"), os.Getenv("POSTGRES_DB"))
-	pool, err := pgxpool.New(context.Background(), connString)
-	if err != nil {
-		return nil, fmt.Errorf("unable to create connection pool: %v", err)
-	}
-
-	return pool, nil
+type MatchmakingRequest struct {
+	PlayerID int
+	Level    int
+	Table    int
 }
 
-func initializeRedisClient() *redis.Client {
-	return redis.NewClient(&redis.Options{
+var rdb *redis.Client
+
+func enqueueMatchmakingRequest(ctx *fiber.Ctx, req MatchmakingRequest) error {
+	playerKey := fmt.Sprintf("player:%d", req.PlayerID)
+	tableKey := "matchmaking:table"
+	// Store player parameters in a hash
+	err := rdb.HSet(ctx.UserContext(), playerKey, "Level", req.Level, "Table", req.Table).Err()
+	if err != nil {
+		return fmt.Errorf("failed to store player parameters: %v", err)
+	}
+	rdb.Expire(ctx.UserContext(), playerKey, 10*time.Second)
+	// Add player to the sorted set by level
+	err = rdb.ZAdd(ctx.UserContext(), tableKey, &redis.Z{
+		Score:  float64(req.Level),
+		Member: req.PlayerID,
+	}).Err()
+
+	if err != nil {
+		return fmt.Errorf("failed to add player to matchmaking queue: %v", err)
+	}
+
+	return nil
+}
+
+func initializeRedisClient() {
+	rdb = redis.NewClient(&redis.Options{
 		Addr: fmt.Sprintf("redis:%s", os.Getenv("REDIS_PORT")),
 	})
 }
-func main() {
-	redisClient := initializeRedisClient()
-	// urlExample := "postgres://username:password@localhost:5432/database_name"
-	dbpool, err := initializeDbConnectionPool()
-	if err != nil {
-		log.Fatal(os.Stderr, "Unable to create connection pool: %v\n", err)
-		return
+
+func findMatch(ctx *fiber.Ctx, req MatchmakingRequest, minPlayers, maxPlayers int, timeout time.Duration) ([]int, error) {
+	tableKey := "matchmaking:table"
+	start := time.Now()
+	for {
+		// Check for timeout
+		if time.Since(start) > timeout {
+			// Handle fallback or return error
+			return nil, fmt.Errorf("timeout reached, no match found")
+		}
+
+		// Find potential matches
+		results, err := rdb.ZRangeByScore(ctx.UserContext(), tableKey, &redis.ZRangeBy{
+			Min: strconv.Itoa(req.Level - 1),
+			Max: strconv.Itoa(req.Level + 1),
+		}).Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to search for matches: %v", err)
+		}
+
+		// Filter results based on additional conditions
+		var matches []int
+		for _, res := range results {
+			playerID, _ := strconv.Atoi(res)
+			playerParams, err := rdb.HGetAll(ctx.UserContext(), fmt.Sprintf("player:%d", playerID)).Result()
+			if err != nil {
+				continue
+			}
+
+			table, _ := strconv.Atoi(playerParams["Table"])
+			log.Debug("results", table, req.Table, playerID, req.PlayerID, table == req.Table && playerID != req.PlayerID)
+			if table == req.Table && playerID != req.PlayerID {
+				matches = append(matches, playerID)
+			}
+		}
+		log.Info(len(matches), minPlayers)
+		// Check if we have enough players for a match
+		if len(matches) >= minPlayers-1 {
+			return matches, nil
+		}
+
+		time.Sleep(200 * time.Millisecond) // Avoid busy waiting
 	}
-	defer dbpool.Close()
+}
+
+func main() {
+	initializeRedisClient()
 
 	app := fiber.New(fiber.Config{
 		Prefork:       true,
@@ -46,60 +101,53 @@ func main() {
 		ServerHeader:  "Fiber",
 		AppName:       "Test App v1.0.1",
 	})
-
-	app.Use(func(c *fiber.Ctx) error {
-		c.Locals("dbPool", dbpool)
-		// Go to next middleware:
-		return c.Next()
-	})
+	app.Use(recover.New())
 	handler := func(ctx *fiber.Ctx) error {
 		table := ctx.Params("table")
-		level1 := ctx.Params("level")
-		// SAVE TO DATABASE BEFORE
-		dbPool := ctx.Locals("dbPool").(*pgxpool.Pool)
-		tx, err := dbPool.Begin(ctx.UserContext())
-		if err != nil {
-			return ctx.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		defer func() {
-			if err != nil {
-				tx.Rollback(ctx.UserContext())
-				log.Error("Transaction rolled back due to error:", err)
-			}
-		}()
-		_, err = tx.Exec(ctx.UserContext(), "INSERT INTO matching_games (user_id, level, table_g) VALUES (1, $1, $2)", level1, table)
-		if err != nil {
-			return ctx.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		err = tx.Commit(ctx.UserContext())
-		if err != nil {
-			return ctx.Status(500).JSON(fiber.Map{"error": err.Error()})
-		}
-		if err := redisClient.Publish(ctx.UserContext(), fmt.Sprintf("user-table-%s-level-%s", table, level1), 1).Err(); err != nil {
-			log.Fatal("Error publishing message to Redis: ", err)
-			return ctx.Status(500).JSON(fiber.Map{"error": "Error publishing message to Redis"})
-		}
+		level := ctx.Params("level")
+		reqHeaders := ctx.GetReqHeaders()
+		playerID := reqHeaders["Playerid"][0]
 
-		i, err := strconv.Atoi(level1)
+		iLevel, err := strconv.Atoi(level)
 		if err != nil {
 			log.Fatal("level must be an integer")
 			return ctx.Status(400).JSON(fiber.Map{"error": "level must be an integer"})
 		}
-		level2 := strconv.Itoa(i + 1)
-
-		subscriber := redisClient.Subscribe(ctx.UserContext(), fmt.Sprintf("user-table-%s-level-%s", table, level1), fmt.Sprintf("user-table-%s-level-%s", table, level2))
-		for {
-			msg, err := subscriber.ReceiveMessage(ctx.UserContext())
-			if err != nil {
-				return ctx.Status(500).JSON(fiber.Map{"error": err.Error()})
-			}
-			log.Info("Received message from " + msg.Channel + " channel. Payload: " + msg.Payload)
-			return ctx.Status(200).JSON(fiber.Map{"message": fmt.Sprintf("Found match with user %s", msg.Payload)})
+		iTable, err := strconv.Atoi(table)
+		if err != nil {
+			log.Fatal("level must be an integer")
+			return ctx.Status(400).JSON(fiber.Map{"error": "table must be an integer"})
 		}
-	}
-	app.Get("/:table/:level", timeout.NewWithContext(handler, 60*time.Second))
+		iPlayerID, err := strconv.Atoi(playerID)
+		if err != nil {
+			log.Fatal("level must be an integer")
+			return ctx.Status(400).JSON(fiber.Map{"error": "table must be an integer"})
+		}
 
-	err = app.Listen(":3000")
+		req := MatchmakingRequest{
+			PlayerID: iPlayerID,
+			Level:    iLevel,
+			Table:    iTable,
+		}
+		err = enqueueMatchmakingRequest(ctx, req)
+		if err != nil {
+			log.Fatalf("Error enqueuing matchmaking request: %v", err)
+		}
+		minPlayers := 2
+		maxPlayers := 4
+		timeoutCheck := 10 * time.Second
+
+		matches, err := findMatch(ctx, req, minPlayers, maxPlayers, timeoutCheck)
+		if err != nil {
+			return ctx.Status(400).JSON(fiber.Map{"error": fmt.Sprintf("Error finding match: %v", err)})
+		}
+		log.Info("Match found with players: %v\n", matches)
+		return ctx.Status(200).JSON(fiber.Map{"message": fmt.Sprintf("Match found with players: %v", matches)})
+	}
+
+	app.Get("/:table/:level", handler)
+
+	err := app.Listen(":3000")
 	if err != nil {
 		return
 	}
